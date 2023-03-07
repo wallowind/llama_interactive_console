@@ -63,13 +63,42 @@ def load(
     return generator
 
 
+def make_buffers(max_len: int, pad_token: int, gpu: int):
+    fin = torch.tensor([-13], dtype=torch.long).cuda()
+    prompt = torch.full((1, max_len), pad_token).cuda().long()
+    return fin, prompt
+
+
+def tokenize_or_wait(prompt: torch.Tensor, fin: torch.Tensor, gen: LLaMA, gpu: int):
+    if gpu == 0:
+        input_prompt = input("Person: ")
+        if len(input_prompt) == 0:
+            prompt[0, 0] = fin
+        else:
+            tokens = gen.tokenize(input_prompt).cuda()
+            prompt[0, :len(tokens)] = tokens
+        torch.distributed.send(prompt, dst=1, tag=42)
+    elif gpu == 1:
+        torch.distributed.recv(prompt, src=0, tag=42)
+    return 0
+
+
+def write_or_close(prompt: torch.Tensor, fin: torch.Tensor, gen: LLaMA, t: float, p: float):
+    if prompt[0, 0] == fin:
+        return None
+    else:
+        result = gen.generate(prompt, max_gen_len=64, temperature=t, top_p=p)
+        prompt = prompt.fill_(gen.tokenizer.pad_id)
+        return result
+
+
 def main(
     ckpt_dir: str,
     tokenizer_path: str,
     temperature: float = 0.8,
     top_p: float = 0.95,
-    max_seq_len: int = 512,
-    max_batch_size: int = 32,
+    max_seq_len: int = 256,
+    max_batch_size: int = 2,
 ):
     local_rank, world_size = setup_model_parallel()
     if local_rank > 0:
@@ -78,41 +107,21 @@ def main(
     generator = load(
         ckpt_dir, tokenizer_path, local_rank, world_size, max_seq_len, max_batch_size
     )
-
-    prompts = [
-        # For these prompts, the expected answer is the natural continuation of the prompt
-        "I believe the meaning of life is",
-        "Simply put, the theory of relativity states that ",
-        "Building a website can be done in 10 simple steps:\n",
-        # Few shot prompts: https://huggingface.co/blog/few-shot-learning-gpt-neo-and-inference-api
-        """Tweet: "I hate it when my phone battery dies."
-Sentiment: Negative
-###
-Tweet: "My day has been 👍"
-Sentiment: Positive
-###
-Tweet: "This is the link to the article"
-Sentiment: Neutral
-###
-Tweet: "This new music video was incredibile"
-Sentiment:""",
-        """Translate English to French:
-
-sea otter => loutre de mer
-
-peppermint => menthe poivrée
-
-plush girafe => girafe peluche
-
-cheese =>""",
-    ]
-    results = generator.generate(
-        prompts, max_gen_len=256, temperature=temperature, top_p=top_p
-    )
-
-    for result in results:
-        print(result)
-        print("\n==================================\n")
+    torch.distributed.barrier()
+    fin, prompt = make_buffers(max_seq_len, generator.tokenizer.pad_id, local_rank)
+    torch.distributed.barrier()
+    while True:
+        tokenize_or_wait(prompt=prompt, fin=fin, gen=generator, gpu=local_rank)
+        torch.distributed.barrier()
+        result = write_or_close(prompt=prompt, fin=fin, gen=generator, p=top_p, t=temperature)
+        torch.distributed.barrier()
+        if result is None:
+            break
+        else:
+            for result in result:
+                print(f"Llama: {result}")
+        torch.distributed.barrier()
+    return
 
 
 if __name__ == "__main__":
