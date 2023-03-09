@@ -15,7 +15,7 @@ class LLaMA:
         self.tokenizer = tokenizer
 
     def tokenize(self, prompt: str):
-        print(prompt)
+        # print(prompt)  # For testing purpose only
         return torch.tensor(self.tokenizer.encode(prompt, bos=True, eos=False), dtype=torch.long)
 
     def generate(

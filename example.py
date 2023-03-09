@@ -29,6 +29,27 @@ def setup_model_parallel() -> Tuple[int, int]:
     return local_rank, world_size
 
 
+def force_parallel(checkpoint: dict, n_gpus: int = 2):
+    assert n_gpus == 2, "More parallelizm to be done."
+    ckpt1 = dict()
+    ckpt2 = dict()
+    for k, v in checkpoint.items():
+        size = v.size()
+        # ColumnParallel
+        if k.split(".")[-2] in ["wq", "wk", "wv", "w1", "w3", "output"]:
+            ckpt1[k] = v[:size[0] // 2, :]
+            ckpt2[k] = v[size[0] // 2:, :]
+        # RowParallel
+        elif k.split(".")[-2] in ["wo", "w2", "tok_embeddings"]:
+            ckpt1[k] = v[:, :size[1] // 2]
+            ckpt2[k] = v[:, size[1] // 2:]
+        # NonParallel?
+        else:
+            ckpt1[k] = v
+            ckpt2[k] = v
+    return ckpt1, ckpt2
+
+
 def load(
     ckpt_dir: str,
     tokenizer_path: str,
@@ -39,12 +60,24 @@ def load(
 ) -> LLaMA:
     start_time = time.time()
     checkpoints = sorted(Path(ckpt_dir).glob("*.pth"))
-    assert world_size == len(
-        checkpoints
-    ), f"Loading a checkpoint for MP={len(checkpoints)} but world size is {world_size}"
-    ckpt_path = checkpoints[local_rank]
-    print("Loading")
-    checkpoint = torch.load(ckpt_path, map_location="cpu")
+    # assert world_size == len(
+    #     checkpoints
+    # ), f"Loading a checkpoint for MP={len(checkpoints)} but world size is {world_size}"
+    if world_size == len(checkpoints):  # default mode
+        ckpt_path = checkpoints[local_rank]
+        checkpoint = torch.load(ckpt_path, map_location="cpu")
+    elif world_size == 2 and len(checkpoints) == 1:  # 7B to two GPUs
+        if local_rank == 0:  # Load weights once
+            ckpt_path = checkpoints[local_rank]
+            checkpoint = torch.load(ckpt_path, map_location="cpu")
+            checkpoint, _ = force_parallel(checkpoint)
+        if local_rank == 1:  # Load weights once
+            ckpt_path = checkpoints[0]
+            checkpoint = torch.load(ckpt_path, map_location="cpu")
+            _, checkpoint = force_parallel(checkpoint)
+        torch.distributed.barrier()
+    else:
+        raise NotImplementedError("Further parallelization to be done.")
     with open(Path(ckpt_dir) / "params.json", "r") as f:
         params = json.loads(f.read())
 
@@ -69,7 +102,7 @@ def make_buffers(max_len: int, pad_token: int, gpu: int):
     return fin, prompt
 
 
-def tokenize_or_wait(prompt: torch.Tensor, fin: torch.Tensor, gen: LLaMA, gpu: int):
+def tokenize_or_wait(prompt: torch.Tensor, fin: torch.Tensor, gen: LLaMA, gpu: int, parallel: bool):
     if gpu == 0:
         input_prompt = input("Person: ")
         if len(input_prompt) == 0:
@@ -77,7 +110,8 @@ def tokenize_or_wait(prompt: torch.Tensor, fin: torch.Tensor, gen: LLaMA, gpu: i
         else:
             tokens = gen.tokenize(input_prompt).cuda()
             prompt[0, :len(tokens)] = tokens
-        torch.distributed.send(prompt, dst=1, tag=42)
+        if parallel:
+            torch.distributed.send(prompt, dst=1, tag=42)
     elif gpu == 1:
         torch.distributed.recv(prompt, src=0, tag=42)
     return 0
@@ -97,8 +131,8 @@ def main(
     tokenizer_path: str,
     temperature: float = 0.8,
     top_p: float = 0.95,
-    max_seq_len: int = 256,
-    max_batch_size: int = 2,
+    max_seq_len: int = 512,
+    max_batch_size: int = 1,
 ):
     local_rank, world_size = setup_model_parallel()
     if local_rank > 0:
@@ -107,19 +141,19 @@ def main(
     generator = load(
         ckpt_dir, tokenizer_path, local_rank, world_size, max_seq_len, max_batch_size
     )
-    torch.distributed.barrier()
     fin, prompt = make_buffers(max_seq_len, generator.tokenizer.pad_id, local_rank)
     torch.distributed.barrier()
     while True:
-        tokenize_or_wait(prompt=prompt, fin=fin, gen=generator, gpu=local_rank)
+        tokenize_or_wait(prompt=prompt, fin=fin, gen=generator, gpu=local_rank, parallel=world_size > 1)
         torch.distributed.barrier()
         result = write_or_close(prompt=prompt, fin=fin, gen=generator, p=top_p, t=temperature)
         torch.distributed.barrier()
         if result is None:
             break
         else:
-            for result in result:
-                print(f"Llama: {result}")
+            if local_rank == 0:
+                for result in result:
+                    print(f"Llama: {result}")
         torch.distributed.barrier()
     return
 
