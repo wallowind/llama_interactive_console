@@ -9,6 +9,10 @@ import fire
 import time
 import json
 
+import torch.distributed as dist
+
+from contextlib import contextmanager
+
 from pathlib import Path
 
 from fairscale.nn.model_parallel.initialize import initialize_model_parallel
@@ -67,15 +71,15 @@ def load(
         ckpt_path = checkpoints[local_rank]
         checkpoint = torch.load(ckpt_path, map_location="cpu")
     elif world_size == 2 and len(checkpoints) == 1:  # 7B to two GPUs
-        if local_rank == 0:  # Load weights once
+        if local_rank == 0:
             ckpt_path = checkpoints[local_rank]
             checkpoint = torch.load(ckpt_path, map_location="cpu")
             checkpoint, _ = force_parallel(checkpoint)
-        if local_rank == 1:  # Load weights once
+        if local_rank == 1:
             ckpt_path = checkpoints[0]
             checkpoint = torch.load(ckpt_path, map_location="cpu")
             _, checkpoint = force_parallel(checkpoint)
-        torch.distributed.barrier()
+        dist.barrier()
     else:
         raise NotImplementedError("Further parallelization to be done.")
     with open(Path(ckpt_dir) / "params.json", "r") as f:
@@ -110,10 +114,9 @@ def tokenize_or_wait(prompt: torch.Tensor, fin: torch.Tensor, gen: LLaMA, gpu: i
         else:
             tokens = gen.tokenize(input_prompt).cuda()
             prompt[0, :len(tokens)] = tokens
-        if parallel:
-            torch.distributed.send(prompt, dst=1, tag=42)
-    elif gpu == 1:
-        torch.distributed.recv(prompt, src=0, tag=42)
+    if parallel:
+        with tmp_process_group():
+            mlink(prompt)
     return 0
 
 
@@ -126,12 +129,36 @@ def write_or_close(prompt: torch.Tensor, fin: torch.Tensor, gen: LLaMA, t: float
         return result
 
 
+@contextmanager
+def tmp_process_group(backend="nccl"):
+    # Source: https://github.com/pytorch/elastic/blob/master/examples/imagenet/main.py
+    new_pg = dist.new_group(backend=backend)
+    try:
+        yield new_pg
+    finally:
+        dist.destroy_process_group(new_pg)
+
+
+def mlink(prompt: torch.Tensor):
+    # Source: https://h-huang.github.io/tutorials/intermediate/dist_tuto.html
+    rank = dist.get_rank()
+    size = dist.get_world_size()
+    send_buff = prompt.clone()
+    recv_buff = prompt.clone()
+    if rank == 0:
+        send_req = dist.isend(send_buff, 1)
+        send_req.wait()
+    else:
+        dist.recv(recv_buff, 0)
+    prompt[:] = recv_buff[:]
+
+
 def main(
     ckpt_dir: str,
     tokenizer_path: str,
     temperature: float = 0.8,
     top_p: float = 0.95,
-    max_seq_len: int = 512,
+    max_seq_len: int = 256,
     max_batch_size: int = 1,
 ):
     local_rank, world_size = setup_model_parallel()
@@ -142,19 +169,18 @@ def main(
         ckpt_dir, tokenizer_path, local_rank, world_size, max_seq_len, max_batch_size
     )
     fin, prompt = make_buffers(max_seq_len, generator.tokenizer.pad_id, local_rank)
-    torch.distributed.barrier()
+    dist.barrier()
     while True:
         tokenize_or_wait(prompt=prompt, fin=fin, gen=generator, gpu=local_rank, parallel=world_size > 1)
-        torch.distributed.barrier()
         result = write_or_close(prompt=prompt, fin=fin, gen=generator, p=top_p, t=temperature)
-        torch.distributed.barrier()
+        dist.barrier()
         if result is None:
             break
         else:
             if local_rank == 0:
                 for result in result:
                     print(f"Llama: {result}")
-        torch.distributed.barrier()
+        dist.barrier()
     return
 
 
